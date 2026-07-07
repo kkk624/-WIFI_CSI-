@@ -1,0 +1,14 @@
+# WiFi-CSI 人体姿态识别 上位机依赖
+# 1.py: PyQt5 + pyqtgraph 实时可视化
+# 2.py: PyQt5 + pyqtgraph + scipy 信号处理可视化
+# 3.py: matplotlib + scikit-learn 机器学习检测
+
+numpy>=1.24.0
+pyserial>=3.5
+pyqtgraph>=0.13.0
+PyQt5>=5.15.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+scikit-learn>=1.3.0
+joblib>=1.2.0
+pandas>=2.1.0

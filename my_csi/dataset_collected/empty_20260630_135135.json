@@ -1,0 +1,40 @@
+{
+  "created_at": "2026-06-30T13:51:38",
+  "label": "empty",
+  "rows": 84,
+  "frames": 84,
+  "sensitivity": "低误报",
+  "active_score": 3.0,
+  "quiet_score": 1.1,
+  "sample_rate_assumed": 50.0,
+  "sliding_window_seconds": 2.0,
+  "sliding_window_frames": 100,
+  "calibration_seconds": 3.0,
+  "calibration_frames": 150,
+  "calibration_quality": {
+    "possibly_dirty": false,
+    "activity_p50": 0.029140766710042953,
+    "activity_p90": 0.03891049697995186,
+    "activity_p99": 0.04463529959321022,
+    "stability_ratio": 1.5317132880318929,
+    "noise_activity": 0.03891049697995186,
+    "noise_posture": 0.05894066020846367,
+    "noise_burst": 0.05647922307252884
+  },
+  "feature_columns": [
+    "window_motion",
+    "window_motion_mean",
+    "window_motion_peak",
+    "window_posture",
+    "window_burst",
+    "window_spread",
+    "active_ratio",
+    "peaks"
+  ],
+  "score_columns": [
+    "activity",
+    "posture",
+    "burst",
+    "spread"
+  ]
+}
