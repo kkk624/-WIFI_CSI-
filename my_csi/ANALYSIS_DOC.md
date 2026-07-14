@@ -494,21 +494,229 @@ noise_activity = (1 - 0.01) * noise_activity + 0.01 * activity
 | `{label}_{timestamp}.npz` | 完整原始数据（压缩存储） |
 | `{label}_{timestamp}.json` | 采集元数据 |
 
-#### 2.8.2 NPZ 文件包含的数据
+#### 2.8.2 子载波数量说明
 
-| 键 | 维度 | 说明 |
-|----|------|------|
-| `raw_frames` | (N, 384) | 原始 signed CSI 值 |
-| `amp_frames` | (N, 120) | 去边缘幅度 |
-| `amp_full_frames` | (N, 128) | 完整幅度 |
-| `phase_frames` | (N, 128) | 相位数据 |
-| `log_amp_frames` | (N, 120) | 对数幅度 |
-| `norm_frames` | (N, 120) | 中心化后数据 |
-| `filtered_frames` | (N, 120) | EMA 滤波后数据 |
-| `scores` | (N, 4) | activity, posture, burst, spread |
-| `window_features` | (M, 8) | 滑动窗口特征 |
+本系统使用 ESP32 WiFi HT40 模式，CSI 数据包含以下子载波：
 
-#### 2.8.3 采集时长选项
+| 部分 | 子载波数量 | 频率范围 | 说明 |
+|------|-----------|---------|------|
+| **LLTF** | 64 | 低频段 | Legacy LTF（用于兼容旧设备） |
+| **HT-LTF** | 128 | 全频段 | High-Throughput LTF（主要用于 CSI 分析） |
+| **总子载波** | 192 | - | LLTF + HT-LTF |
+
+**数据排列方式**：
+- ESP32 发送的原始 CSI 数据共 **384 字节**
+- 前 128 字节：LLTF 的 I/Q 数据（64 子载波 × 2 字节）
+- 后 256 字节：HT-LTF 的 I/Q 数据（128 子载波 × 2 字节）
+- 每个子载波占用 2 字节：`[imaginary, real]`（虚部在前，实部在后）
+
+**数据转换过程**：
+
+```
+原始 384 字节 (uint8):
+┌─────────────────────────────────────────────────────────────────┐
+│ LLTF (128字节) │ HT-LTF (256字节)                               │
+│ [I0, R0, I1, R1, ..., I63, R63] │ [I0, R0, I1, R1, ..., I127, R127] │
+└─────────────────────────────────────────────────────────────────┘
+         │                                               │
+         │ 符号转换: value - 256 if value > 127           │
+         │                                               │
+         ▼                                               ▼
+┌─────────────────┐                         ┌─────────────────────┐
+│ LLTF (64子载波) │                         │ HT-LTF (128子载波)  │
+│ real[64], imag[64] │                     │ real[128], imag[128] │
+└─────────────────┘                         └─────────────────────┘
+                                               │
+                                               │ 幅度计算: sqrt(R² + I²)
+                                               │ 相位计算: arctan2(I, R)
+                                               │
+                                               ▼
+                                   ┌─────────────────────────────┐
+                                   │ amp_full_frames (128维)     │
+                                   │ phase_frames (128维)       │
+                                   └─────────────────────────────┘
+                                               │
+                                               │ 去边缘: 去掉两端各4个子载波
+                                               │ 子载波索引 [4:124]
+                                               │
+                                               ▼
+                                   ┌─────────────────────────────┐
+                                   │ amp_frames (120维)          │
+                                   └─────────────────────────────┘
+```
+
+#### 2.8.3 NPZ 文件详细数据结构
+
+NPZ 文件是 numpy 的压缩归档格式，包含以下 9 个数组：
+
+##### 2.8.3.1 原始数据类（保留完整信息）
+
+| 键名 | 维度 | 数据类型 | 计算方式 | 排列说明 |
+|------|------|---------|---------|---------|
+| `raw_frames` | (N, 384) | int8 | ESP32 原始值，符号转换后 | 第 0 轴：帧序号（0~N-1）<br>第 1 轴：字节序号（0~383）<br>[i, 0:128] = LLTF<br>[i, 128:384] = HT-LTF |
+| `amp_full_frames` | (N, 128) | float32 | `sqrt(R² + I²)` | 第 0 轴：帧序号<br>第 1 轴：子载波索引（0~127）<br>每个元素是对应子载波的幅度 |
+| `phase_frames` | (N, 128) | float32 | `arctan2(imag, real)` | 第 0 轴：帧序号<br>第 1 轴：子载波索引（0~127）<br>范围 [-π, π]，**需校准后使用** |
+
+##### 2.8.3.2 预处理数据类（实时处理中间结果）
+
+| 键名 | 维度 | 数据类型 | 计算方式 | 排列说明 |
+|------|------|---------|---------|---------|
+| `amp_frames` | (N, 120) | float32 | `amp_full_frames[:, 4:124]` | 去边缘后的幅度<br>第 1 轴：子载波索引（4~123，共 120 个） |
+| `log_amp_frames` | (N, 120) | float32 | `np.log(amp_frames)` | 对数变换后的幅度 |
+| `norm_frames` | (N, 120) | float32 | `clip(log_amp - median(log_amp), -3, 3)` | 中值中心化 + 裁剪 |
+| `filtered_frames` | (N, 120) | float32 | EMA 滤波（α=0.38） | 平滑后的数据 |
+
+##### 2.8.3.3 特征类（最终处理结果）
+
+| 键名 | 维度 | 数据类型 | 计算方式 | 排列说明 |
+|------|------|---------|---------|---------|
+| `scores` | (N, 4) | float32 | 噪声归一化后的分数 | 第 0 轴：帧序号<br>第 1 轴：特征索引<br>[i, 0] = activity<br>[i, 1] = posture<br>[i, 2] = burst<br>[i, 3] = spread |
+| `window_features` | (M, 8) | float32 | 滑动窗口统计特征 | 第 0 轴：窗口序号（0~M-1）<br>第 1 轴：窗口特征索引<br>[j, 0] = window_motion<br>[j, 1] = window_motion_mean<br>[j, 2] = window_motion_peak<br>[j, 3] = window_posture<br>[j, 4] = window_burst<br>[j, 5] = window_spread<br>[j, 6] = active_ratio<br>[j, 7] = peaks |
+
+**N 和 M 的关系**：
+- `N`：采集的总帧数（等于 CSV 行数）
+- `M`：滑动窗口数量，`M = ceil(N / WINDOW_STEP)`，其中 `WINDOW_STEP = 25`
+- 窗口重叠率：75%（每个窗口 100 帧，步长 25 帧）
+
+##### 2.8.3.4 数据读取示例
+
+```python
+import numpy as np
+
+# 加载 NPZ 文件
+data = np.load('empty_20260709_031838.npz')
+
+# 读取原始 CSI 数据
+raw = data['raw_frames']      # shape: (1951, 384), dtype: int8
+amp = data['amp_full_frames'] # shape: (1951, 128), dtype: float32
+phase = data['phase_frames']  # shape: (1951, 128), dtype: float32
+
+# 读取第 100 帧的数据
+frame_idx = 100
+frame_raw = raw[frame_idx]           # 384 个原始字节
+frame_amp = amp[frame_idx]           # 128 个子载波幅度
+frame_phase = phase[frame_idx]       # 128 个子载波相位
+
+# 读取第 0 个窗口的特征
+window_idx = 0
+window_feat = data['window_features'][window_idx]  # 8 个窗口特征
+
+# 读取第 100 帧的四个帧级特征
+scores = data['scores'][100]  # [activity, posture, burst, spread]
+```
+
+#### 2.8.4 CSV 文件详细结构
+
+CSV 文件包含每帧的处理结果，共 16 列：
+
+| 列序号 | 列名 | 数据类型 | 计算方式 | 说明 |
+|--------|------|---------|---------|------|
+| 1 | `timestamp` | float64 | Python `time.time()` | 采集时间戳（秒） |
+| 2 | `label` | string | 用户选择的标签 | 动作标签 |
+| 3 | `frame` | int | 帧序号（从校准后开始） | 帧计数 |
+| 4 | `activity` | float32 | `max(0, activity/noise - 1)` | 动作强度分数 |
+| 5 | `posture` | float32 | `max(0, posture/noise - 1)` | 姿态变化分数 |
+| 6 | `burst` | float32 | `max(0, burst/noise - 1)` | 突发变化分数 |
+| 7 | `spread` | float32 | 受影响子载波比例 | 影响范围 |
+| 8 | `window_label` | string | 规则分类器输出 | 当前窗口分类结果 |
+| 9 | `window_motion` | float32 | `0.45*top + 0.35*mean + 0.20*burst` | 窗口综合动作评分 |
+| 10 | `window_motion_mean` | float32 | `mean(motion[-100:])` | 窗口动作均值 |
+| 11 | `window_motion_peak` | float32 | `max(motion[-100:])` | 窗口动作峰值 |
+| 12 | `window_posture` | float32 | `max(posture[-100:])` | 窗口姿态峰值 |
+| 13 | `window_burst` | float32 | `max(burst[-100:])` | 窗口突发峰值 |
+| 14 | `window_spread` | float32 | `mean(spread[-100:])` | 窗口平均影响范围 |
+| 15 | `active_ratio` | float32 | `mean(motion > threshold)` | 活跃帧比例 |
+| 16 | `peaks` | int | 峰值计数算法 | 窗口内峰值数量 |
+
+**CSV 排列说明**：
+- 每行对应一帧数据
+- 第 1 行是表头（列名）
+- 第 2 行开始是数据，按时间顺序排列
+- 帧序号从校准完成后开始计数（第 150 帧开始）
+
+**CSV 读取示例**：
+```python
+import pandas as pd
+
+df = pd.read_csv('empty_20260709_031838.csv')
+
+# 获取所有帧的 activity 分数
+activities = df['activity'].values  # shape: (1951,)
+
+# 获取所有帧的窗口特征（8 列）
+window_features = df[['window_motion', 'window_motion_mean', 
+                      'window_motion_peak', 'window_posture',
+                      'window_burst', 'window_spread',
+                      'active_ratio', 'peaks']].values  # shape: (1951, 8)
+```
+
+#### 2.8.5 JSON 文件详细结构
+
+JSON 文件记录采集时的配置参数和校准质量信息：
+
+```json
+{
+  "created_at": "2026-07-09T03:19:38",
+  "label": "empty",
+  "rows": 1951,
+  "frames": 1951,
+  "raw_frames": 1951,
+  "sensitivity": "高灵敏度",
+  "active_score": 1.2,
+  "quiet_score": 0.55,
+  "sample_rate_assumed": 50.0,
+  "sliding_window_seconds": 2.0,
+  "sliding_window_frames": 100,
+  "calibration_seconds": 3.0,
+  "calibration_frames": 150,
+  "calibration_quality": {
+    "possibly_dirty": false,
+    "activity_p50": 0.0257,
+    "activity_p90": 0.0285,
+    "activity_p99": 0.0295,
+    "stability_ratio": 1.144,
+    "noise_activity": 0.0287,
+    "noise_posture": 0.0540,
+    "noise_burst": 0.0430
+  },
+  "duration_seconds": 60,
+  "npz_keys": ["raw_frames", "amp_frames", ...],
+  "raw_data_shapes": {
+    "raw_frames": [384],
+    "amp_frames": [120],
+    "amp_full_frames": [128],
+    "phase_frames": [128],
+    "log_amp_frames": [120]
+  },
+  "feature_columns": ["window_motion", ...],
+  "score_columns": ["activity", "posture", "burst", "spread"]
+}
+```
+
+**关键字段说明**：
+- `calibration_quality.possibly_dirty`：是否可能被污染（`stability_ratio > 6.0`）
+- `calibration_quality.stability_ratio`：`p99 / p50`，值越大越不稳定
+- `calibration_quality.noise_*`：各特征的噪声基线值
+- `raw_data_shapes`：NPZ 中各数据的单帧维度
+
+#### 2.8.6 三个文件的数据对应关系
+
+```
+帧 0 → raw_frames[0] → amp_frames[0] → log_amp_frames[0] → norm_frames[0] → filtered_frames[0] → scores[0] → CSV 第1行
+帧 1 → raw_frames[1] → amp_frames[1] → log_amp_frames[1] → norm_frames[1] → filtered_frames[1] → scores[1] → CSV 第2行
+...
+帧 N-1 → raw_frames[N-1] → ... → scores[N-1] → CSV 第N行
+
+窗口 0 → scores[0:100] → window_features[0]
+窗口 1 → scores[25:125] → window_features[1]
+窗口 2 → scores[50:150] → window_features[2]
+...
+窗口 M-1 → scores[N-99:N] → window_features[M-1]
+
+JSON → 记录整个采集的配置和校准信息
+```
+
+#### 2.8.7 采集时长选项
 
 - 手动停止
 - 10 秒
@@ -517,7 +725,7 @@ noise_activity = (1 - 0.01) * noise_activity + 0.01 * activity
 - 120 秒
 - 300 秒
 
-#### 2.8.4 标签管理
+#### 2.8.8 标签管理
 
 - 自定义标签列表，保存在 `labels_config.json`
 - 默认标签：`empty`, `walk`, `wave`, `squat`, `fall`
