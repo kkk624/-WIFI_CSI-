@@ -59,7 +59,27 @@ LABEL_HOLD_FRAMES = 12
 CALIBRATION_SECONDS = 3.0
 CALIBRATION_FRAMES = int(ASSUMED_SAMPLE_RATE * CALIBRATION_SECONDS)
 DATASET_DIR = os.path.join(os.path.dirname(__file__), "dataset_collected")
-LABELS = ["empty", "walk", "wave", "squat", "fall"]
+LABELS_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "labels_config.json")
+
+
+def load_labels():
+    if os.path.exists(LABELS_CONFIG_PATH):
+        try:
+            with open(LABELS_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+    return ["empty", "walk", "wave", "squat", "fall"]
+
+
+def save_labels(labels):
+    with open(LABELS_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(labels, f, ensure_ascii=False, indent=2)
+
+
+LABELS = load_labels()
 SENSITIVITY_PROFILES = {
     "高灵敏度": {"active": 1.2, "quiet": 0.55},
     "标准": {"active": 2.0, "quiet": 0.8},
@@ -85,14 +105,24 @@ def parse_csi_line(line):
     real = htltf[0::2]
     imag = htltf[1::2]
     amp = np.sqrt(real * real + imag * imag)
+    phase = np.arctan2(imag, real)
 
-    # Avoid edge/null carriers dominating the normalization.
-    amp = amp[4:-4]
-    return np.maximum(amp, 1.0)
+    # 完整幅度（128子载波）和处理后幅度（去掉边缘4个）
+    amp_full = np.maximum(amp, 1.0)
+    amp_trimmed = np.maximum(amp[4:-4], 1.0)
+
+    return {
+        "amp": amp_trimmed,        # 120维，去边缘，用于实时处理
+        "amp_full": amp_full,       # 128维，完整幅度
+        "raw": raw,                 # 384维，原始signed值
+        "real": real,               # 128维，实部
+        "imag": imag,               # 128维，虚部
+        "phase": phase,             # 128维，相位
+    }
 
 
 class SerialReader(QThread):
-    frame_ready = pyqtSignal(np.ndarray)
+    frame_ready = pyqtSignal(object)
     status_ready = pyqtSignal(str)
 
     def __init__(self, port):
@@ -127,14 +157,14 @@ class SerialReader(QThread):
                         if not line.startswith("CSI_DATA"):
                             continue
                         try:
-                            amp = parse_csi_line(line)
+                            data = parse_csi_line(line)
                         except Exception:
-                            amp = None
-                        if amp is None:
+                            data = None
+                        if data is None:
                             self.bad_lines += 1
                             continue
                         self.frames += 1
-                        self.frame_ready.emit(amp)
+                        self.frame_ready.emit(data)
                 else:
                     time.sleep(0.001)
 
@@ -215,8 +245,16 @@ class MotionMonitor(QMainWindow):
         self.record_filtered_frames = []
         self.record_scores = []
         self.record_window_features = []
+        self.record_raw_frames = []
+        self.record_amp_frames = []
+        self.record_amp_full_frames = []
+        self.record_phase_frames = []
+        self.record_log_amp_frames = []
         self.record_label_value = ""
         self.last_calibration_quality = {}
+        self.record_duration = 0
+        self.record_start_time = 0.0
+        self.record_timer = None
 
         self._build_ui()
 
@@ -260,6 +298,15 @@ class MotionMonitor(QMainWindow):
         self.label_combo = QComboBox()
         self.label_combo.addItems(LABELS)
         controls.addWidget(self.label_combo)
+
+        self.edit_labels_btn = QPushButton("编辑标签")
+        self.edit_labels_btn.clicked.connect(self.edit_labels)
+        controls.addWidget(self.edit_labels_btn)
+
+        controls.addWidget(QLabel("时长:"))
+        self.duration_combo = QComboBox()
+        self.duration_combo.addItems(["手动停止", "10秒", "30秒", "60秒", "120秒", "300秒"])
+        controls.addWidget(self.duration_combo)
 
         self.record_btn = QPushButton("开始采集")
         self.record_btn.clicked.connect(self.toggle_recording)
@@ -357,10 +404,12 @@ class MotionMonitor(QMainWindow):
         os.makedirs(DATASET_DIR, exist_ok=True)
         label = self.label_combo.currentText()
         self.record_label_value = label
+        label_dir = os.path.join(DATASET_DIR, label)
+        os.makedirs(label_dir, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(DATASET_DIR, "{}_{}.csv".format(label, stamp))
-        self.record_npz_path = os.path.join(DATASET_DIR, "{}_{}.npz".format(label, stamp))
-        self.record_meta_path = os.path.join(DATASET_DIR, "{}_{}.json".format(label, stamp))
+        path = os.path.join(label_dir, "{}_{}.csv".format(label, stamp))
+        self.record_npz_path = os.path.join(label_dir, "{}_{}.npz".format(label, stamp))
+        self.record_meta_path = os.path.join(label_dir, "{}_{}.json".format(label, stamp))
         self.record_file = open(path, "w", newline="", encoding="utf-8")
         fieldnames = [
             "timestamp",
@@ -388,24 +437,44 @@ class MotionMonitor(QMainWindow):
         self.record_filtered_frames = []
         self.record_scores = []
         self.record_window_features = []
+        self.record_raw_frames = []
+        self.record_amp_frames = []
+        self.record_amp_full_frames = []
+        self.record_phase_frames = []
+        self.record_log_amp_frames = []
         self.record_btn.setText("停止采集")
-        self.record_label.setText("采集中: {}".format(os.path.basename(path)))
+
+        # 解析采集时长
+        dur_text = self.duration_combo.currentText()
+        self.record_duration = 0
+        if dur_text != "手动停止":
+            self.record_duration = int(dur_text.replace("秒", ""))
+            self.record_start_time = time.time()
+            self.record_timer = QTimer(self)
+            self.record_timer.setSingleShot(True)
+            self.record_timer.timeout.connect(self.stop_recording)
+            self.record_timer.start(self.record_duration * 1000)
+            self.record_label.setText("采集中: {} ({}秒)".format(os.path.basename(path), self.record_duration))
+        else:
+            self.record_label.setText("采集中: {} (手动停止)".format(os.path.basename(path)))
         self.event_log.append("开始采集: {}".format(path))
 
     def stop_recording(self):
+        if self.record_timer:
+            self.record_timer.stop()
+            self.record_timer = None
         if self.record_file:
             self.record_file.flush()
             self.record_file.close()
         if self.record_npz_path and self.record_scores:
-            np.savez_compressed(
-                self.record_npz_path,
-                label=self.record_label_value,
-                norm_frames=np.asarray(self.record_norm_frames, dtype=np.float32),
-                filtered_frames=np.asarray(self.record_filtered_frames, dtype=np.float32),
-                scores=np.asarray(self.record_scores, dtype=np.float32),
-                window_features=np.asarray(self.record_window_features, dtype=np.float32),
-                score_names=np.asarray(["activity", "posture", "burst", "spread"]),
-                window_feature_names=np.asarray(
+            save_dict = {
+                "label": self.record_label_value,
+                "norm_frames": np.asarray(self.record_norm_frames, dtype=np.float32),
+                "filtered_frames": np.asarray(self.record_filtered_frames, dtype=np.float32),
+                "scores": np.asarray(self.record_scores, dtype=np.float32),
+                "window_features": np.asarray(self.record_window_features, dtype=np.float32),
+                "score_names": np.asarray(["activity", "posture", "burst", "spread"]),
+                "window_feature_names": np.asarray(
                     [
                         "window_motion",
                         "window_motion_mean",
@@ -417,17 +486,31 @@ class MotionMonitor(QMainWindow):
                         "peaks",
                     ]
                 ),
-            )
+            }
+            # 保存原始数据
+            if self.record_raw_frames:
+                save_dict["raw_frames"] = np.asarray(self.record_raw_frames, dtype=np.float32)
+            if self.record_amp_frames:
+                save_dict["amp_frames"] = np.asarray(self.record_amp_frames, dtype=np.float32)
+            if self.record_amp_full_frames:
+                save_dict["amp_full_frames"] = np.asarray(self.record_amp_full_frames, dtype=np.float32)
+            if self.record_phase_frames:
+                save_dict["phase_frames"] = np.asarray(self.record_phase_frames, dtype=np.float32)
+            if self.record_log_amp_frames:
+                save_dict["log_amp_frames"] = np.asarray(self.record_log_amp_frames, dtype=np.float32)
+            np.savez_compressed(self.record_npz_path, **save_dict)
         if self.record_meta_path:
             self._write_record_metadata()
+        total_raw = len(self.record_raw_frames)
         self.record_file = None
         self.record_writer = None
         self.record_npz_path = None
         self.record_meta_path = None
         self.record_label_value = ""
         self.recording = False
+        self.record_duration = 0
         self.record_btn.setText("开始采集")
-        self.record_label.setText("已保存 {} 行 + NPZ".format(self.record_count))
+        self.record_label.setText("已保存 {} 行 + NPZ (原始帧 {})".format(self.record_count, total_raw))
 
     def reset_baseline(self):
         self.baseline = None
@@ -467,7 +550,8 @@ class MotionMonitor(QMainWindow):
             self.feature_label.setText("请保持静止 {:.0f} 秒".format(CALIBRATION_SECONDS))
             self.event_log.clear()
 
-    def process_frame(self, amp):
+    def process_frame(self, data):
+        amp = data["amp"]
         # Use both subcarrier-shape changes and total-level changes. A strong
         # per-frame normalization can erase walking/waving, so keep level as a
         # separate feature instead of discarding it.
@@ -555,7 +639,7 @@ class MotionMonitor(QMainWindow):
         self.burst_history.append(burst_score)
         self.spread_history.append(spread)
         self.threshold_history.append(self.active_score())
-        self._record_current_frame(norm, self.filtered_norm, activity_score, posture_score, burst_score, spread)
+        self._record_current_frame(norm, self.filtered_norm, activity_score, posture_score, burst_score, spread, data, log_amp)
 
         self._update_sliding_window()
 
@@ -740,12 +824,18 @@ class MotionMonitor(QMainWindow):
             self.record_file.flush()
             self.record_label.setText("已采集 {} 行".format(self.record_count))
 
-    def _record_current_frame(self, norm, filtered_norm, activity, posture, burst, spread):
+    def _record_current_frame(self, norm, filtered_norm, activity, posture, burst, spread, data, log_amp):
         if not self.recording:
             return
         self.record_norm_frames.append(np.asarray(norm, dtype=np.float32).copy())
         self.record_filtered_frames.append(np.asarray(filtered_norm, dtype=np.float32).copy())
         self.record_scores.append([activity, posture, burst, spread])
+        # 保存原始数据
+        self.record_raw_frames.append(np.asarray(data["raw"], dtype=np.float32).copy())
+        self.record_amp_frames.append(np.asarray(data["amp"], dtype=np.float32).copy())
+        self.record_amp_full_frames.append(np.asarray(data["amp_full"], dtype=np.float32).copy())
+        self.record_phase_frames.append(np.asarray(data["phase"], dtype=np.float32).copy())
+        self.record_log_amp_frames.append(np.asarray(log_amp, dtype=np.float32).copy())
 
     def _write_record_metadata(self):
         metadata = {
@@ -753,6 +843,7 @@ class MotionMonitor(QMainWindow):
             "label": self.record_label_value,
             "rows": self.record_count,
             "frames": len(self.record_scores),
+            "raw_frames": len(self.record_raw_frames),
             "sensitivity": self.sensitivity_combo.currentText(),
             "active_score": self.active_score(),
             "quiet_score": self.quiet_score(),
@@ -762,6 +853,20 @@ class MotionMonitor(QMainWindow):
             "calibration_seconds": CALIBRATION_SECONDS,
             "calibration_frames": CALIBRATION_FRAMES,
             "calibration_quality": self.last_calibration_quality,
+            "duration_seconds": self.record_duration,
+            "npz_keys": [
+                "raw_frames", "amp_frames", "amp_full_frames",
+                "phase_frames", "log_amp_frames",
+                "norm_frames", "filtered_frames",
+                "scores", "window_features",
+            ],
+            "raw_data_shapes": {
+                "raw_frames": [384],
+                "amp_frames": [120],
+                "amp_full_frames": [128],
+                "phase_frames": [128],
+                "log_amp_frames": [120],
+            },
             "feature_columns": [
                 "window_motion",
                 "window_motion_mean",
@@ -818,6 +923,12 @@ class MotionMonitor(QMainWindow):
         return "小动作/不确定"
 
     def update_plots(self):
+        # 采集倒计时显示
+        if self.recording and self.record_duration > 0:
+            elapsed = time.time() - self.record_start_time
+            remain = max(0, self.record_duration - elapsed)
+            self.record_label.setText("采集中: 剩余 {:.0f}s | 已采 {} 帧".format(remain, len(self.record_raw_frames)))
+
         if self.motion_history:
             motion = np.asarray(self.motion_history, dtype=np.float32)
             self.motion_curve.setData(motion)
@@ -867,6 +978,92 @@ class MotionMonitor(QMainWindow):
                         f["peaks"],
                     )
                 )
+
+    def edit_labels(self):
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QLabel, QMessageBox
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("编辑动作标签")
+        dialog.resize(400, 400)
+
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel("当前标签列表："))
+        self.label_list = QListWidget()
+        for label in LABELS:
+            self.label_list.addItem(QListWidgetItem(label))
+        layout.addWidget(self.label_list)
+
+        input_layout = QHBoxLayout()
+        self.new_label_input = QLineEdit()
+        self.new_label_input.setPlaceholderText("输入新标签名称")
+        input_layout.addWidget(self.new_label_input)
+
+        add_btn = QPushButton("添加")
+        add_btn.clicked.connect(self._add_label)
+        input_layout.addWidget(add_btn)
+        layout.addLayout(input_layout)
+
+        btn_layout = QHBoxLayout()
+        delete_btn = QPushButton("删除选中")
+        delete_btn.clicked.connect(self._delete_label)
+        btn_layout.addWidget(delete_btn)
+
+        clear_btn = QPushButton("清空")
+        clear_btn.clicked.connect(self._clear_labels)
+        btn_layout.addWidget(clear_btn)
+
+        default_btn = QPushButton("恢复默认")
+        default_btn.clicked.connect(self._restore_default_labels)
+        btn_layout.addWidget(default_btn)
+
+        btn_layout.addStretch()
+        ok_btn = QPushButton("确定")
+        ok_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(ok_btn)
+        layout.addLayout(btn_layout)
+
+        dialog.exec_()
+
+        current_text = self.label_combo.currentText()
+        self.label_combo.clear()
+        self.label_combo.addItems(LABELS)
+        if current_text in LABELS:
+            self.label_combo.setCurrentText(current_text)
+
+    def _add_label(self):
+        text = self.new_label_input.text().strip()
+        if text and text not in LABELS:
+            LABELS.append(text)
+            self.label_list.addItem(QListWidgetItem(text))
+            self.new_label_input.clear()
+            save_labels(LABELS)
+
+    def _delete_label(self):
+        current = self.label_list.currentItem()
+        if current:
+            text = current.text()
+            if len(LABELS) <= 1:
+                QMessageBox.warning(self, "警告", "至少保留一个标签")
+                return
+            LABELS.remove(text)
+            self.label_list.takeItem(self.label_list.row(current))
+            save_labels(LABELS)
+
+    def _clear_labels(self):
+        if QMessageBox.question(self, "确认", "确定清空所有标签？", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            LABELS.clear()
+            self.label_list.clear()
+            save_labels(LABELS)
+
+    def _restore_default_labels(self):
+        if QMessageBox.question(self, "确认", "确定恢复默认标签？", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            global LABELS
+            LABELS = ["empty", "walk", "wave", "squat", "fall"]
+            save_labels(LABELS)
+            self.label_list.clear()
+            for label in LABELS:
+                self.label_list.addItem(QListWidgetItem(label))
 
     def closeEvent(self, event):
         if self.recording:
